@@ -26,7 +26,7 @@ bash scripts/smoke_examples.sh
 
 The script verifies, against the actual binary:
 
-1. `sdkt --version` reports `2.5.0`.
+1. `sdkt --version` reports `2.7.0`.
 2. `sdkt wasm inspect crates/sdkt-cli/tests/fixtures/us_old.wasm` shows a
    contract spec with `fn transfer`.
 3. `sdkt audit examples/sample_token/src/lib.rs` reports `AUTH-001` on
@@ -105,12 +105,23 @@ sdkt init my-project --minimal   # scaffolds a project + .sdkt.toml
 sdkt inspect <CONTRACT_ID> --abi contract.wasm
 sdkt storage check <CONTRACT_ID> --abi contract.wasm
 sdkt storage analyze <CONTRACT_ID>
+# Estimate storage rent offline for a WASM contract (per-class breakdown and total)
+sdkt storage estimate contract.wasm
 
-# NOTE: `sdkt storage estimate` is NOT YET IMPLEMENTED (placeholder only —
-# it prints a stub message and does not compute a real storage-cost estimate).
-
-# Read a contract storage entry by its complete LedgerKey (base64 XDR)
+# Read a contract storage entry.
+# Option A — raw LedgerKey (base64 or hex XDR), the advanced escape hatch:
 sdkt storage read --contract <CONTRACT_ID> --key-xdr <BASE64_LEDGER_KEY>
+
+# Option B — typed key built from the contract's own types (same TYPE:VALUE
+# syntax as `sdkt call --args`). This builds ScVec[symbol, args...]:
+#   persistent map entry keyed by a symbol + address:
+sdkt storage read --contract <CONTRACT_ID> --map-key balances --key-arg address:G...
+#   composite key (symbol + multiple typed args):
+sdkt storage read --contract <CONTRACT_ID> --map-key allowance --key-arg address:G... --key-arg address:G...
+#   temporary durability (defaults to persistent):
+sdkt storage read --contract <CONTRACT_ID> --map-key session --key-arg u32:100 --durability temporary
+#   the contract's instance-storage entry:
+sdkt storage read --contract <CONTRACT_ID> --instance
 
 # Extend TTL of the contract instance (and optional extra keys)
 # --ledgers is relative: entries will live at least N ledgers past the current ledger.
@@ -119,6 +130,34 @@ sdkt storage extend --contract <CONTRACT_ID> --ledgers 17280 --identity my-deplo
 ```
 
 ### Transaction lifecycle
+
+### Composite JSON arguments
+
+`call` and `invoke` accept repeated `--args-json` values. Each value is a JSON
+array whose elements are encoded as positional Soroban arguments, in order;
+the encoded values are appended after any `--args` values.
+
+| JSON value | Soroban value |
+| --- | --- |
+| `null` | `Void` |
+| `true` / `false` | `Bool` |
+| JSON string | `String` |
+| integer in signed 32-bit range | `I32` |
+| non-negative integer up to unsigned 32-bit range | `U32` |
+| larger signed integer | `I64` |
+| larger non-negative integer | `U64` |
+| JSON array | `Vec` |
+| JSON object | `Map<String, ScVal>` |
+
+For example:
+
+```bash
+sdkt call C... transfer --args-json '["alice", {"amount": 100}, null]'
+sdkt invoke C... transfer --args-json '["alice", {"amount": 100}]'
+```
+
+Malformed JSON, non-array roots, unsupported number representations, and values
+that exceed Soroban collection limits fail before any RPC request is sent.
 
 Build, validate, simulate, sign, and submit a Soroban transaction:
 
@@ -162,6 +201,7 @@ read the network from `.sdkt.toml` or default to testnet RPC.
 
 ```bash
 sdkt events <CONTRACT_ID> --abi contract.wasm
+sdkt events <CONTRACT_ID> --topic transfer   # only events whose first topic is `transfer`
 sdkt account <ADDRESS>
 sdkt fee estimate
 ```
@@ -272,11 +312,15 @@ sdkt call C... balance --format json --network-profile testnet
 
 # ABI-aware result decoding (requires contractspecv0 WASM)
 sdkt call C... balance --abi /path/to/contract.wasm --format json --network-profile testnet
+
+# Same, but the ABI comes from the deployed contract (no local WASM needed)
+sdkt call C... balance --abi-contract C... --format json --network-profile testnet
 ```
 
-- `--args` accepts typed values: `u32:N`, `u64:N`, `i32:N`, `i64:N`, `bool:true|false`, `string:text`, `address:G...`
+- `--args` accepts typed values: `u32:N`, `u64:N`, `i32:N`, `i64:N`, `timepoint:N`, `duration:N`, `bool:true|false`, `string:text`, `address:G...`
 - `--abi <wasm>` enables ABI-aware result decoding using the contract spec from a local WASM file. Without it, the raw base64 XDR result is shown.
-- When `--abi` is supplied and the function is found in the spec, the decoded human-readable label appears in the output. JSON includes both raw and decoded fields.
+- `--abi-contract <id>` resolves the ABI from the deployed contract over RPC instead (`inspect_contract` → `get_wasm_bytecode` → spec parse) — no local artifact needed. Mutually exclusive with `--abi`.
+- When an ABI is supplied and the function is found in the spec, the decoded human-readable label appears in the output. JSON includes both raw and decoded fields.
 - If the function is not in the ABI, the raw result is preserved and a warning is emitted to stderr.
 - If `--abi` WASM is invalid/unparseable, the command fails with a clear error.
 - No identity required — call is read-only via `simulateTransaction`
@@ -293,6 +337,14 @@ sdkt invoke C... increment --args u32:1 --identity alice --network-profile testn
 
 # JSON output for scripting
 sdkt invoke C... set_admin --args address:G... --identity alice --format json --network-profile testnet
+
+# Build and sign the envelope, but do not submit it
+sdkt invoke C... set_admin --args address:G... --identity alice --network-profile testnet --build-only
+# → prints the base64 envelope plus the simulated fee and sequence.
+# Feed it straight back into the offline/remote path:
+sdkt tx validate --envelope <that-xdr>
+sdkt tx sign     --input <that-xdr> --identity other --output signed.txt
+sdkt tx submit   --envelope signed.txt --wait
 ```
 
 - `--args` uses the same `TYPE:VALUE` syntax as `call`, but is strict: an
@@ -303,12 +355,21 @@ sdkt invoke C... set_admin --args address:G... --identity alice --format json --
   inclusion fee); the footprint and auth entries come from the same simulation.
 - Output shows the transaction hash, final status, fee, and result XDR.
   Exit code is non-zero when the transaction fails or is rejected.
+- `--build-only` runs sequence fetch → simulation → envelope build → signing
+  and stops before submission: no `sendTransaction`, no polling, no state
+  change. It prints the envelope (pretty: `Transaction Envelope (NOT submitted):`
+  block; JSON: `envelopeXdr` plus `fee` and `sequence`) and exits 0. The mainnet
+  safety guard still applies, and simulation failures surface exactly as they do
+  on the submit path. The emitted envelope is byte-for-byte what `invoke` would
+  have submitted, so it round-trips through `tx validate` / `tx sign` /
+  `tx submit`.
 - Relation to `tx build/sign/submit`: `invoke` is the one-command equivalent of
   `tx build` (with a real sequence + simulated fees) → `tx sign` →
-  `tx submit --wait`. Use the `tx` subcommands when you need to inspect or
+  `tx submit --wait`; `invoke --build-only` covers the first two without the
+  `tx` round-trip. Use the `tx` subcommands when you need to inspect or
   modify the envelope between steps; use `invoke` for the common straight path.
 - Limitations (core implementation): single-operation only, no ABI-aware
-  result decoding of the return value, no `--fee` override, no dry-run flag.
+  result decoding of the return value, no `--fee` override.
   A live Testnet smoke test is documented here but NOT exercised in CI.
 
 ## CI gating (copy-paste)
@@ -330,7 +391,7 @@ jobs:
       - uses: SaboLabs/soroban-devkit/.github/actions/sdkt@main
         with:
           command: audit
-          sdkt-version: v2.5.0
+          sdkt-version: v2.7.0
           target: contracts/token/src/lib.rs
           severity-threshold: critical
 ```
@@ -351,7 +412,7 @@ jobs:
       - uses: SaboLabs/soroban-devkit/.github/actions/sdkt@main
         with:
           command: upgrade-safety
-          sdkt-version: v2.5.0
+          sdkt-version: v2.7.0
           old-wasm: builds/current.wasm
           new-wasm: builds/candidate.wasm
 ```
